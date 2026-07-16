@@ -123,13 +123,40 @@ def _reciprocal_rank_fusion(
 
 
 def _aggregate(conn: sqlite3.Connection, decision: RouteDecision) -> RetrievalResult:
-    if decision.form_type is None:
-        raise RetrievalError(
-            "Aggregate route needs a form_type to query (none detected in the question — "
-            "mention 'membership' or 'hospital' explicitly)."
+    if decision.form_type is not None:
+        # Scoped to a single form type — original path.
+        rows = structured_store.list_forms(
+            conn, decision.form_type, decision.filters or None
         )
-    rows = structured_store.list_forms(conn, decision.form_type, decision.filters or None)
-    return RetrievalResult(route=decision.route, count=len(rows), rows=rows)
+        return RetrievalResult(route=decision.route, count=len(rows), rows=rows)
+
+    # No form_type detected — aggregate across ALL registered form types so
+    # questions like "How many forms are rejected?" still work instead of
+    # erroring out.  Filters (e.g. status=Rejected) are applied per-type
+    # only when the column actually exists in that type's table.
+    from schemas import FORM_SCHEMAS
+
+    all_rows: list[dict] = []
+    for ft in FORM_SCHEMAS:
+        try:
+            # Only pass filters whose columns exist in this form type's schema
+            applicable_filters: dict | None = None
+            if decision.filters:
+                schema_fields = set(FORM_SCHEMAS[ft].model_fields.keys())
+                applicable_filters = {
+                    col: val
+                    for col, val in decision.filters.items()
+                    if col in schema_fields
+                } or None
+            rows = structured_store.list_forms(conn, ft, applicable_filters)
+            # Tag each row with its form_type for downstream display
+            for r in rows:
+                r.setdefault("form_type", ft)
+            all_rows.extend(rows)
+        except Exception:
+            # Table might not exist yet for a registered type — skip it.
+            pass
+    return RetrievalResult(route=decision.route, count=len(all_rows), rows=all_rows)
 
 
 def _single_form_lookup(conn: sqlite3.Connection, decision: RouteDecision) -> RetrievalResult:
